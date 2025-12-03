@@ -1,30 +1,103 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[1]:
+# In[2]:
 
 
 import os
-import pandas as pd
+import logging
+import rasterio
+from utils import apply_scale_factors, compute_lst, apply_cloud_mask, summarize_scene
+from download_scene import download_scene
 
-OUTPUT_DIR = "/data/output"
+# Directories (mounted PVCs in Kubernetes)
+INPUT_DIR = '/data/input'
+OUTPUT_DIR = '/data/output'
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+
+
+def process_scene(scene_id, path='034', row='032'):
+    """
+    Process a single Landsat scene:
+    1. Download if missing
+    2. Apply scaling, LST conversion, cloud mask
+    3. Write LST raster and summary CSV
+    """
+    thermal_file = os.path.join(INPUT_DIR, f"{scene_id}_B10.TIF")  # Thermal band
+    qa_file = os.path.join(INPUT_DIR, f"{scene_id}_QA_PIXEL.TIF")  # QA_PIXEL band
+
+    # Step 1: Download if missing
+    if not os.path.exists(thermal_file) or not os.path.exists(qa_file):
+        logging.info(f"Scene bands not found locally. Downloading from AWS...")
+        try:
+            download_scene(scene_id, path=path, row=row, local_dir=INPUT_DIR)
+        except FileNotFoundError as e:
+            logging.error(str(e))
+            return
+
+    logging.info(f"Processing scene: {scene_id}")
+
+    # Step 2: Load raster bands
+    try:
+        with rasterio.open(thermal_file) as src:
+            arr = src.read(1).astype('float32')
+            profile = src.profile
+    except Exception as e:
+        logging.error(f"Failed to read {thermal_file}: {e}")
+        return
+
+    qa_arr = None
+    if os.path.exists(qa_file):
+        try:
+            with rasterio.open(qa_file) as src:
+                qa_arr = src.read(1).astype('uint16')
+        except Exception as e:
+            logging.warning(f"Failed to read QA_PIXEL band: {e}. Using fallback thresholds.")
+
+    # Step 3: Apply transformations
+    arr = apply_scale_factors(arr)
+    arr = compute_lst(arr)
+    arr = apply_cloud_mask(arr, qa_arr=qa_arr)
+
+    # Step 4: Write output raster
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    output_raster = os.path.join(OUTPUT_DIR, f"{scene_id}_lst.tif")
+    profile.update(dtype=rasterio.float32)
+
+    try:
+        with rasterio.open(output_raster, 'w', **profile) as dst:
+            dst.write(arr, 1)
+        logging.info(f"LST raster saved: {output_raster}")
+    except Exception as e:
+        logging.error(f"Failed to write raster {output_raster}: {e}")
+
+    # Step 5: Summarize and save CSV
+    summary = summarize_scene(arr)
+    summary_path = os.path.join(OUTPUT_DIR, f"{scene_id}_summary.csv")
+    try:
+        with open(summary_path, 'w') as f:
+            for k, v in summary.items():
+                f.write(f"{k},{v}\n")
+        logging.info(f"Summary CSV saved: {summary_path}")
+    except Exception as e:
+        logging.error(f"Failed to write summary CSV {summary_path}: {e}")
+
 
 def main():
-    summaries = []
+    # Get scene ID from Kubernetes environment variable
+    scene_id = os.environ.get('SCENE_NAME')
+    if not scene_id:
+        logging.error("SCENE_NAME environment variable not set")
+        return
 
-    for filename in os.listdir(OUTPUT_DIR):
-        if filename.endswith("_summary.csv"):
-            scene = filename.replace("_summary.csv", "")
-            df = pd.read_csv(os.path.join(OUTPUT_DIR, filename), header=None, names=["metric", "value"])
-            df["scene"] = scene
-            summaries.append(df)
+    # Optional: specify WRS-2 path/row for AWS download
+    path = os.environ.get('SCENE_PATH', '034')
+    row = os.environ.get('SCENE_ROW', '032')
 
-    if summaries:
-        full = pd.concat(summaries)
-        pivot = full.pivot(index="scene", columns="metric", values="value")
-        pivot.to_csv(os.path.join(OUTPUT_DIR, "all_summaries.csv"))
+    process_scene(scene_id, path=path, row=row)
 
-    print("Aggregated all summaries successfully.")
 
 if __name__ == "__main__":
     main()
