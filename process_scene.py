@@ -53,5 +53,7 @@ def process_scene(scene_id, path='034', row='032'):
         try:
             with rasterio.open(qa_file) as src:
                 qa_arr = src.read(1).astype('uint16')
-        except Exc
+        except Exception as e:
+            logging.error(f"Failed to read QA file {qa_file}: {e}")
+            qa_arr = None
 
